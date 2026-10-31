@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Build the static export and publish it to Cloudflare Pages.
-#   PROJECT / BRANCH can be overridden in the environment.
+#
+# NOTE: a static export cannot check a password. This is for shelves that are
+# MEANT to be public; it passes --public deliberately.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,7 +11,14 @@ BRANCH="${BRANCH:-main}"
 
 cd "$DIR"
 
-python3 tablinum.py build --out dist
+python3 tablinum.py build --out dist --public
+
+echo
+read -r -p "Publish these files to the open internet at $PROJECT.pages.dev? [y/N] " yn
+case "$yn" in
+  [Yy]*) ;;
+  *) echo "Stopped. Nothing was deployed."; exit 1 ;;
+esac
 
 wrangler pages deploy dist \
   --project-name "$PROJECT" \
