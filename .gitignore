@@ -1,3 +1,5 @@
+files/*
+!files/.gitkeep
 dist/
 __pycache__/
 *.pyc
