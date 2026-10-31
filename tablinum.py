@@ -321,6 +321,10 @@ SCRIPT = """<script>
 
 
 def link_for(rel: str) -> str:
+    # Pages serves /x.html as /x, and the local server accepts both, so link the
+    # extensionless form: no redirect hop on the public site, identical URL on the LAN.
+    if rel.lower().endswith(".html"):
+        rel = rel[:-5]
     return MOUNT + "/" + quote(rel)
 
 
