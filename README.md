@@ -53,10 +53,10 @@ Flags: `--dir` selects what gets published (default `./files`), `--host` binds t
 Deliberately boring and identical in both modes:
 
 - `/` — the index
-- `/files/<relative path>` — a file
+- `/files/<relative path>` — a file, e.g. `/files/notes.pdf`
 - `/healthz` — `ok`
 
-Files always live under `/files/`, so a file called `index.html` can never collide with the generated listing.
+Files always live under `/files/`, so a file called `index.html` can never collide with the generated listing. `/files/report.html` and `/files/report` both resolve, because Cloudflare Pages strips the `.html` extension on its own — the two modes then behave the same way.
 
 ### Site text
 
@@ -95,10 +95,24 @@ journalctl --user -u tablinum -f
 ### Cloudflare Pages
 
 ```bash
-./deploy.sh                 # builds ./dist and pushes it to the Pages project
+wrangler pages project create tablinum --production-branch main   # once
+./deploy.sh                                                      # every publish
 ```
 
-Set `PROJECT` and `BRANCH` in `deploy.sh` if you want different names, then attach your domain in the Pages dashboard. Because the export is plain static files, any host works the same way — `dist/` is a website.
+`deploy.sh` runs `tablinum.py build`, which writes `dist/` — an ordinary static
+website — and pushes it. Set `PROJECT` / `BRANCH` in the environment to use
+different names.
+
+Then attach the domain once: **Pages → your project → Custom domains → Set up a
+custom domain**. Cloudflare offers to create the CNAME itself (`docs` →
+`your-project.pages.dev`) and issues the certificate. No config file involved.
+
+**Publishing is a build step.** The listing is generated at build time for the
+static export, so a file appears on the public site when you deploy — whereas on
+the LAN server it appears the moment it is copied in.
+
+Because the export is plain static files, any host works the same way: `dist/`
+is a website (S3, nginx, GitHub Pages, a USB stick).
 
 ### Behind a router or reverse proxy
 

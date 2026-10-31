@@ -415,6 +415,12 @@ def resolve(root: str, url_path: str) -> str | None:
     if target != root_real and not target.startswith(root_real + os.sep):
         return None
     if not os.path.isfile(target):
+        # Cloudflare Pages serves /x.html as /x (it 308-redirects the .html away),
+        # so accept the extensionless form too and both modes behave identically.
+        if not os.path.splitext(target)[1]:
+            alt = target + ".html"
+            if os.path.isfile(alt):
+                return alt
         return None
     return target
 
