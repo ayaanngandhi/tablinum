@@ -45,6 +45,7 @@ cp ~/report.pdf files/
 | `tablinum.py serve --port 6320` | Live server. Newest file first, filter box, nested folders grouped. |
 | `tablinum.py build --out dist` | Static export: `dist/index.html` + `dist/files/**`, ready for Pages/S3/nginx. |
 | `tablinum.py list` | Print the index as plain text (handy in a terminal or a cron mail). |
+| `./publish.sh <file>` | Copy onto the shelf **and** push the public mirror — the everyday command. |
 
 Flags: `--dir` selects what gets published (default `./files`), `--host` binds the interface (default `0.0.0.0`), `-v` logs every request.
 
