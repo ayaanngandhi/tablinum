@@ -56,6 +56,7 @@ MOUNT = "/files"  # files are always served under this prefix, in both modes
 COOKIE = "tablinum_session"
 CSRF_COOKIE = "tablinum_csrf"
 MAX_BODY = 4096           # a login form is tiny; anything larger is not a login
+CSRF_TTL = 3600           # how long a rendered login form stays submittable
 MAX_PASSWORD_LEN = 1024
 BCRYPT_ROUNDS = 12
 
@@ -792,6 +793,22 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
             head.update(extra or {})
             return head
 
+        def _login_response(self, status: int = 200, error: str = "", wait: int = 0,
+                            retry_after: int | None = None):
+            """Render the login page and ALWAYS pair it with a matching CSRF cookie.
+
+            Minting a new token for the form without updating the cookie is what
+            makes someone retype a perfectly correct password and still be told
+            their session expired: the form holds token B, the browser holds A.
+            """
+            csrf = secrets.token_urlsafe(24)
+            page = render_login(cfg, error=error, csrf=csrf, wait=wait).encode("utf-8")
+            extra = {"Set-Cookie": self._cookie(CSRF_COOKIE, csrf, CSRF_TTL)}
+            if retry_after:
+                extra["Retry-After"] = str(retry_after)
+            return self._send(status, page, "text/html; charset=utf-8",
+                              self._html_headers("", extra))
+
         def _not_found(self):
             body = (b"<!doctype html><meta charset=utf-8><title>Not found</title>"
                     b"<body style=\"background:#0c0e0f;color:#d5dade;font-family:Helvetica,Arial,sans-serif;"
@@ -813,11 +830,7 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
 
             if not self._session_ok():
                 if path == "/login":
-                    csrf = secrets.token_urlsafe(24)
-                    page = render_login(cfg, csrf=csrf).encode("utf-8")
-                    return self._send(200, page, "text/html; charset=utf-8",
-                                      self._html_headers("", {
-                                          "Set-Cookie": self._cookie(CSRF_COOKIE, csrf, 600)}))
+                    return self._login_response()
                 return self._redirect("/login")
 
             if path in ("/", "/index.html"):
@@ -889,24 +902,20 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
             ip = self._ip()
             wait = limiter.blocked_for(ip)
             if wait:
-                page = render_login(cfg, csrf=secrets.token_urlsafe(24), wait=wait).encode("utf-8")
-                return self._send(429, page, "text/html; charset=utf-8",
-                                  self._html_headers("", {"Retry-After": str(wait)}))
+                return self._login_response(429, wait=wait, retry_after=wait)
 
             supplied = clean_text(form.get("csrf", ""), 128) or ""
             cookie_csrf = self._cookies().get(CSRF_COOKIE, "")
             if not supplied or not cookie_csrf or not hmac.compare_digest(supplied, cookie_csrf):
                 limiter.record_failure(ip)
-                page = render_login(cfg, error="Your session expired. Try again.",
-                                    csrf=secrets.token_urlsafe(24)).encode("utf-8")
-                return self._send(400, page, "text/html; charset=utf-8", self._html_headers(""))
+                # the form on screen is stale (tab restored, cookie rotated, or the
+                # page sat open past CSRF_TTL) — hand back a fresh, working one
+                return self._login_response(400, "That form expired. Try again.")
 
             password = clean_text(form.get("password", ""))
             if not password or not verify_password(password, stored_hash):
                 limiter.record_failure(ip)
-                page = render_login(cfg, error="That password is not right.",
-                                    csrf=secrets.token_urlsafe(24)).encode("utf-8")
-                return self._send(401, page, "text/html; charset=utf-8", self._html_headers(""))
+                return self._login_response(401, "That password is not right.")
 
             limiter.reset(ip)
             token, ttl = sessions.issue()

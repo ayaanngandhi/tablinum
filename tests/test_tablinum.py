@@ -299,6 +299,37 @@ class AuthFlowTests(ServerTests):
         self.assertEqual((status, body.strip()), (200, b"ok"))
 
 
+class CsrfRecoveryTests(ServerTests):
+    """The bug that made a correct password look wrong.
+
+    A failed login re-rendered the form with a brand-new CSRF token but did not
+    refresh the cookie, so every retry from that page failed with 400 "session
+    expired" no matter what was typed. Own server class = its own rate limiter.
+    """
+
+    def test_error_page_carries_a_working_csrf_token(self):
+        csrf = self._csrf()
+        status, _h, _b = self.c.request("POST", "/login", {"csrf": csrf, "password": "wrong"})
+        self.assertEqual(status, 401)
+        fresh = self.c.cookies.get(T.CSRF_COOKIE)
+        self.assertIsNotNone(fresh)
+        self.assertNotEqual(fresh, csrf, "the replacement token must also replace the cookie")
+        status, _h, _b = self.c.request("POST", "/login",
+                                        {"csrf": fresh, "password": "correct-horse-battery-staple"})
+        self.assertEqual(status, 303)
+        self.assertIn(T.COOKIE, self.c.cookies)
+
+    def test_correct_password_after_two_failures(self):
+        for _ in range(2):
+            csrf = self._csrf()
+            self.c.request("POST", "/login", {"csrf": csrf, "password": "nope"})
+        csrf = self.c.cookies.get(T.CSRF_COOKIE)
+        status, _h, _b = self.c.request("POST", "/login",
+                                        {"csrf": csrf, "password": "correct-horse-battery-staple"})
+        self.assertEqual(status, 303)
+        self.assertEqual(self.c.request("GET", "/")[0], 200)
+
+
 class ThrottleTests(ServerTests):
     def test_repeated_failures_are_throttled(self):
         for _ in range(T.RateLimiter().per_ip_limit):
