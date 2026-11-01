@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import re
 import urllib.parse
 from http.server import ThreadingHTTPServer
 
@@ -174,9 +175,9 @@ class ServerTests(unittest.TestCase):
     def _csrf(self):
         status, _headers, body = self.c.request("GET", "/login")
         self.assertEqual(status, 200)
-        token = self.c.cookies.get(T.CSRF_COOKIE)
-        self.assertTrue(token)
-        return token
+        m = re.search(r'name="csrf" value="([^"]+)"', body.decode())
+        self.assertTrue(m, "the login form must carry a csrf token")
+        return m.group(1)
 
     def login(self, password="correct-horse-battery-staple"):
         csrf = self._csrf()
@@ -274,22 +275,24 @@ class AuthFlowTests(ServerTests):
         self.assertIn(status, (404, 200))
         self.assertNotIn(b"password_hash", body)  # never leaks the hash
 
-    def test_login_sends_one_set_cookie_header_per_cookie(self):
+    def test_login_sets_only_the_session_cookie(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         conn.request("GET", "/login")
         resp = conn.getresponse()
-        csrf = resp.headers["Set-Cookie"].split(";")[0].split("=", 1)[1]
-        resp.read()
+        page = resp.read().decode()
+        csrf = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
         body = urllib.parse.urlencode({"csrf": csrf, "password": "correct-horse-battery-staple"})
         conn.request("POST", "/login", body=body,
-                     headers={"Content-Type": "application/x-www-form-urlencoded",
-                              "Cookie": f"{T.CSRF_COOKIE}={csrf}"})
+                     headers={"Content-Type": "application/x-www-form-urlencoded"})
         resp = conn.getresponse()
         resp.read()
         cookies = resp.headers.get_all("Set-Cookie") or []
         origins = [c.split(";")[0].split("=", 1)[0].strip() for c in cookies]
         self.assertEqual(resp.status, 303)
         self.assertIn(T.COOKIE, origins)
+        # the CSRF token travels in the form only — a second cookie is a second
+        # thing to desynchronise, and that is exactly how the login died
+        self.assertNotIn(T.CSRF_COOKIE, origins)
         for c in cookies:
             self.assertNotIn(",", c.split(";")[0], f"cookie value contains a comma: {c}")
         conn.close()
@@ -307,27 +310,39 @@ class CsrfRecoveryTests(ServerTests):
     expired" no matter what was typed. Own server class = its own rate limiter.
     """
 
-    def test_error_page_carries_a_working_csrf_token(self):
+    def test_retry_after_a_wrong_password_uses_the_same_token(self):
         csrf = self._csrf()
         status, _h, _b = self.c.request("POST", "/login", {"csrf": csrf, "password": "wrong"})
         self.assertEqual(status, 401)
-        fresh = self.c.cookies.get(T.CSRF_COOKIE)
-        self.assertIsNotNone(fresh)
-        self.assertNotEqual(fresh, csrf, "the replacement token must also replace the cookie")
-        status, _h, _b = self.c.request("POST", "/login",
-                                        {"csrf": fresh, "password": "correct-horse-battery-staple"})
-        self.assertEqual(status, 303)
-        self.assertIn(T.COOKIE, self.c.cookies)
-
-    def test_correct_password_after_two_failures(self):
-        for _ in range(2):
-            csrf = self._csrf()
-            self.c.request("POST", "/login", {"csrf": csrf, "password": "nope"})
-        csrf = self.c.cookies.get(T.CSRF_COOKIE)
         status, _h, _b = self.c.request("POST", "/login",
                                         {"csrf": csrf, "password": "correct-horse-battery-staple"})
         self.assertEqual(status, 303)
+        self.assertIn(T.COOKIE, self.c.cookies)
+
+    def test_token_survives_the_page_being_fetched_again(self):
+        # a reload, a second tab, or an edge prefetch must not invalidate the
+        # form that is already on screen
+        csrf = self._csrf()
+        for _ in range(3):
+            self._csrf()
+        status, _h, _b = self.c.request("POST", "/login",
+                                        {"csrf": csrf, "password": "correct-horse-battery-staple"})
+        self.assertEqual(status, 303)
+
+    def test_correct_password_after_two_failures(self):
+        for _ in range(2):
+            self.c.request("POST", "/login", {"csrf": self._csrf(), "password": "nope"})
+        status, _h, _b = self.c.request("POST", "/login",
+                                        {"csrf": self._csrf(), "password": "correct-horse-battery-staple"})
+        self.assertEqual(status, 303)
         self.assertEqual(self.c.request("GET", "/")[0], 200)
+
+    def test_a_forged_or_expired_token_is_still_rejected(self):
+        for bad in ("123.deadbeef", "0." + "0" * 32, "no-dot-here", ""):
+            status, _h, _b = self.c.request("POST", "/login",
+                                            {"csrf": bad, "password": "correct-horse-battery-staple"})
+            self.assertEqual(status, 400, f"accepted a forged token: {bad!r}")
+            self.assertNotIn(T.COOKIE, self.c.cookies)
 
 
 class ThrottleTests(ServerTests):

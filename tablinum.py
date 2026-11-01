@@ -616,6 +616,34 @@ def render(files: list[dict], *, eyebrow: str, title: str, tagline: str,
             .replace("__SCRIPT__", SCRIPT.replace("__NONCE__", nonce) if files else ""))
 
 
+def issue_csrf(secret: str, ttl: int = CSRF_TTL) -> str:
+    """A CSRF token that proves itself, so it cannot go stale behind a cookie.
+
+    Double-submit (form token must equal a cookie) breaks the moment the browser
+    and the server disagree about which token is current: a prefetch, a duplicated
+    GET, a restored tab, or an edge cache rotating one and not the other. The
+    person then retypes a correct password and is told the form expired. Signing
+    the timestamp instead removes the round-trip entirely — the token is valid for
+    CSRF_TTL no matter how many times the page is fetched.
+    """
+    ts = str(int(time.time()))
+    mac = hmac.new(bytes.fromhex(secret), f"csrf:{ts}".encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{ts}.{mac}"
+
+
+def csrf_ok(secret: str, token: str, ttl: int = CSRF_TTL) -> bool:
+    if not secret or not token or "." not in token:
+        return False
+    ts, _, mac = token.partition(".")
+    if not ts.isdigit() or not mac:
+        return False
+    age = int(time.time()) - int(ts)
+    if age < -60 or age > ttl:          # not from the future, not older than ttl
+        return False
+    want = hmac.new(bytes.fromhex(secret), f"csrf:{ts}".encode(), hashlib.sha256).hexdigest()[:32]
+    return hmac.compare_digest(mac, want)
+
+
 def render_login(cfg: dict, error: str = "", csrf: str = "", wait: int = 0) -> str:
     if wait:
         error = f"Too many attempts. Try again in {wait} second{'' if wait == 1 else 's'}."
@@ -707,6 +735,7 @@ def clean_text(value: str | None, limit: int = MAX_PASSWORD_LEN) -> str | None:
 def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
     sessions = Sessions(auth["secret"], auth.get("session_hours", 12)) if auth else None
     stored_hash = auth["password_hash"] if auth else None
+    session_secret = auth["secret"] if auth else ""
     limiter = RateLimiter()
 
     class Handler(BaseHTTPRequestHandler):
@@ -801,11 +830,9 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
             makes someone retype a perfectly correct password and still be told
             their session expired: the form holds token B, the browser holds A.
             """
-            csrf = secrets.token_urlsafe(24)
+            csrf = issue_csrf(session_secret)
             page = render_login(cfg, error=error, csrf=csrf, wait=wait).encode("utf-8")
-            extra = {"Set-Cookie": self._cookie(CSRF_COOKIE, csrf, CSRF_TTL)}
-            if retry_after:
-                extra["Retry-After"] = str(retry_after)
+            extra = {"Retry-After": str(retry_after)} if retry_after else {}
             return self._send(status, page, "text/html; charset=utf-8",
                               self._html_headers("", extra))
 
@@ -905,12 +932,11 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
                 return self._login_response(429, wait=wait, retry_after=wait)
 
             supplied = clean_text(form.get("csrf", ""), 128) or ""
-            cookie_csrf = self._cookies().get(CSRF_COOKIE, "")
-            if not supplied or not cookie_csrf or not hmac.compare_digest(supplied, cookie_csrf):
-                limiter.record_failure(ip)
-                # the form on screen is stale (tab restored, cookie rotated, or the
-                # page sat open past CSRF_TTL) — hand back a fresh, working one
-                return self._login_response(400, "That form expired. Try again.")
+            if not csrf_ok(session_secret, supplied):
+                print(f"tablinum: rejected a bad/expired csrf token from {ip}", file=sys.stderr)
+                # NOT a password attempt: a stale tab must never burn someone's
+                # attempts and lock them out of their own shelf
+                return self._login_response(400, "That form expired. Reload and try again.")
 
             password = clean_text(form.get("password", ""))
             if not password or not verify_password(password, stored_hash):
@@ -920,8 +946,7 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
             limiter.reset(ip)
             token, ttl = sessions.issue()
             return self._redirect("/", {
-                "Set-Cookie": [self._cookie(COOKIE, token, ttl),
-                               self._cookie(CSRF_COOKIE, "", 0)],
+                "Set-Cookie": self._cookie(COOKIE, token, ttl),
                 "Cache-Control": "no-store",
             })
 
