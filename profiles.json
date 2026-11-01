@@ -1,0 +1,18 @@
+{
+  "default": {
+    "eyebrow": "tablinum · the record room",
+    "title": "Documents",
+    "tagline": "Everything kept in one place — notes, papers, reports and references.",
+    "include": ["*"],
+    "password_env": "TABLINUM_PASSWORD"
+  },
+  "profiles": [
+    {
+      "name": "shared",
+      "title": "Shared documents",
+      "tagline": "The current working notes and one-off papers.",
+      "include": ["short-term/*"],
+      "password_env": "TABLINUM_PASSWORD_SHARED"
+    }
+  ]
+}

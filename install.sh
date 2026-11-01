@@ -8,27 +8,26 @@ PORT="${PORT:-6320}"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/tablinum.service"
 
-# bcrypt lives in the project venv: the system python is externally managed on
-# most distros, so a venv is the only install that does not fight the OS.
+# The project venv is the unit's interpreter: the system python is externally
+# managed on most distros, so a venv avoids fighting the OS. There are no
+# third-party packages to install.
 if [ ! -x "$DIR/.venv/bin/python" ]; then
-  echo "creating .venv and installing bcrypt…"
+  echo "creating .venv…"
   /usr/bin/python3 -m venv "$DIR/.venv"
-  "$DIR/.venv/bin/pip" -q install --upgrade pip
-  "$DIR/.venv/bin/pip" -q install bcrypt
 fi
 PY="$DIR/.venv/bin/python"
 
-# A shelf with no password is not served at all, so make that a setup step.
-if [ ! -f "$DIR/auth.json" ]; then
+# A shelf with no profile password is not served at all, so make that a setup step.
+if [ ! -f "$DIR/.env" ]; then
   echo
-  echo "No password yet. Set one now:"
-  echo "  $PY $DIR/tablinum.py passwd"
+  echo "No .env yet. It needs one password per profile, for example:"
+  echo "  TABLINUM_PASSWORD=…"
+  echo "  TABLINUM_PASSWORD_SHARED=…"
   echo
-  read -r -p "Set it now? [Y/n] " yn
-  case "${yn:-Y}" in
-    [Yy]*) "$PY" "$DIR/tablinum.py" passwd ;;
-    *) echo "Skipped — the service will refuse to start until a password exists." ;;
-  esac
+  echo "Copy .env.example to .env and edit it:"
+  echo "  cp $DIR/.env.example $DIR/.env"
+  echo
+  echo "The service will refuse to start until at least one profile has a password."
 fi
 
 mkdir -p "$UNIT_DIR"

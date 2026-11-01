@@ -5,8 +5,11 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# credential file: bcrypt hash + session secret. never commit this.
+# credential file: session secret. never commit this.
 auth.json
 
-# local virtualenv holding bcrypt
+# profile passwords live here, never in profiles.json
+.env
+
+# local virtualenv (the unit's interpreter; no third-party packages)
 .venv/

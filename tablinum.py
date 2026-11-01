@@ -6,14 +6,16 @@ In a Roman house the tablinum was the record room opening off the atrium: the
 place the family's papers were kept. This is that room, for files — and unlike a
 real tablinum, it can be locked.
 
-    python3 tablinum.py passwd                  # set the one password (bcrypt)
     python3 tablinum.py serve --port 6320       # live server, listing files/
+    python3 tablinum.py status                  # profiles, files, sessions
     python3 tablinum.py build --out dist        # static export (refuses while locked)
 
-One password, stored only as a bcrypt hash. Sessions are HMAC-signed cookies.
-No database, no user accounts, no external services.
+Profiles live in profiles.json; each has its own password, kept in .env, and its
+own set of glob patterns over files/. The login asks for a password only — the
+password itself says which shelf opens. Sessions are HMAC-signed cookies. No
+database, no user accounts, no external services.
 
-Requires: Python 3.8+ and `bcrypt` (pip install bcrypt).
+Requires: Python 3.8+ and the standard library only.
 
 MIT licensed. https://github.com/ayaanngandhi/tablinum
 """
@@ -21,36 +23,29 @@ MIT licensed. https://github.com/ayaanngandhi/tablinum
 from __future__ import annotations
 
 import argparse
-import getpass
 import hashlib
 import hmac
 import html
 import json
 import os
 import posixpath
+import re
 import secrets
 import shutil
-import stat
 import sys
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Mapping, Sequence
 from urllib.parse import quote, unquote, urlsplit
 
-try:
-    import bcrypt
-except ImportError:  # pragma: no cover - guidance beats a traceback
-    sys.stderr.write(
-        "tablinum: bcrypt is required for the login feature.\n"
-        "  python3 -m pip install bcrypt\n"
-        "  or: python3 -m venv .venv && .venv/bin/pip install bcrypt\n"
-    )
-    raise SystemExit(2)
-
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ROOT = os.path.join(HERE, "files")
 AUTH_PATH = os.path.join(HERE, "auth.json")
+PROFILES_PATH = os.path.join(HERE, "profiles.json")
+ENV_PATH = os.path.join(HERE, ".env")
 MOUNT = "/files"  # files are always served under this prefix, in both modes
 
 COOKIE = "tablinum_session"
@@ -58,7 +53,6 @@ CSRF_COOKIE = "tablinum_csrf"
 MAX_BODY = 4096           # a login form is tiny; anything larger is not a login
 CSRF_TTL = 3600           # how long a rendered login form stays submittable
 MAX_PASSWORD_LEN = 1024
-BCRYPT_ROUNDS = 12
 
 SKIP = {".DS_Store", "Thumbs.db", ".git", "__pycache__", ".venv"}
 
@@ -159,22 +153,19 @@ def collect(root: str) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-# auth: one password, bcrypt at rest, signed sessions
+# profiles: one password per shelf, stored in the environment
 # --------------------------------------------------------------------------
 
-def load_auth() -> dict | None:
-    if not os.path.exists(AUTH_PATH):
-        return None
-    try:
-        with open(AUTH_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError) as exc:
-        print(f"tablinum: cannot read {AUTH_PATH}: {exc}", file=sys.stderr)
-        return None
-    if not isinstance(data, dict) or "password_hash" not in data or "secret" not in data:
-        print(f"tablinum: {AUTH_PATH} is malformed — re-run `tablinum.py passwd`", file=sys.stderr)
-        return None
-    return data
+PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+PASSWORD_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+DEFAULT_EYEBROW = "tablinum · the record room"
+DEFAULT_TITLE = "Documents"
+DEFAULT_TAGLINE = "Everything kept in one place — notes, papers, reports and references."
+
+
+class ConfigError(Exception):
+    """Operator-facing config problem: printed to stderr, never a traceback."""
 
 
 def write_auth(data: dict) -> None:
@@ -188,36 +179,278 @@ def write_auth(data: dict) -> None:
     os.replace(tmp, AUTH_PATH)
 
 
-def hash_password(password: str, rounds: int = BCRYPT_ROUNDS) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds)).decode("ascii")
+def load_env(path: str) -> dict[str, str]:
+    """Read KEY=VALUE pairs from a dotenv file. Missing file is not an error.
 
-
-def verify_password(password: str, stored_hash: str) -> bool:
+    Values are never echoed: a malformed line is reported by number only, because
+    the most likely malformed line is the one holding a password.
+    """
+    out: dict[str, str] = {}
     try:
-        return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("ascii"))
-    except (ValueError, TypeError):
-        return False
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return out
+    except OSError as exc:
+        print(f"tablinum: cannot read {path}: {exc}", file=sys.stderr)
+        return out
+
+    for lineno, raw in enumerate(lines, 1):
+        line = raw.rstrip("\r\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        line = line.lstrip()
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if "=" not in line:
+            print(f"tablinum: {path}:{lineno}: ignoring a malformed line", file=sys.stderr)
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            print(f"tablinum: {path}:{lineno}: ignoring a malformed line", file=sys.stderr)
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        # the real environment wins, and a file's first spelling of a key wins
+        if key in os.environ or key in out:
+            continue
+        out[key] = value
+    return out
 
 
-def set_password(password: str, keep_sessions: bool = False) -> None:
-    if not password:
-        raise SystemExit("tablinum: refusing to set an empty password")
-    if len(password) > MAX_PASSWORD_LEN:
-        raise SystemExit(f"tablinum: password too long (max {MAX_PASSWORD_LEN})")
-    existing = load_auth() or {}
-    data = {
-        "password_hash": hash_password(password),
-        # rotating the secret on a password change signs every old session out
-        "secret": existing.get("secret") if keep_sessions and existing.get("secret")
-                  else secrets.token_hex(32),
-        "session_hours": existing.get("session_hours", 12),
-        "updated": int(time.time()),
+def environ_with_env_file() -> dict[str, str]:
+    """os.environ, with .env filling in only the variables it does not already have."""
+    env = dict(os.environ)
+    env.update(load_env(ENV_PATH))
+    return env
+
+
+def _compile_pattern(pattern: str) -> re.Pattern:
+    """One include glob -> regex. `*` crosses `/`, so a folder glob is recursive."""
+    pat = pattern.replace("\\", "/")
+    while pat.startswith("./") or pat.startswith("/"):
+        pat = pat[2:] if pat.startswith("./") else pat[1:]
+    if not pat:
+        raise ConfigError("profiles.json: an include pattern is empty")
+    if pat.startswith("/") or os.path.isabs(pat):
+        raise ConfigError(f"profiles.json: include pattern is absolute: {pattern!r}")
+    if ".." in pat.split("/"):
+        raise ConfigError(f"profiles.json: include pattern contains '..': {pattern!r}")
+    rx = re.escape(pat).replace(r"\*", ".*").replace(r"\?", ".")
+    return re.compile(rx, re.IGNORECASE | re.DOTALL)
+
+
+def matches(rel: str, patterns: Sequence[str]) -> bool:
+    """True when rel (relative to files/, '/'-separated) matches any pattern."""
+    rel = rel.replace("\\", "/")
+    return any(_compile_pattern(pattern).fullmatch(rel) for pattern in patterns)
+
+
+@dataclass(frozen=True)
+class Profile:
+    """One password, one slice of files/."""
+
+    name: str
+    include: tuple[str, ...]
+    password_env: str
+    password: str          # resolved value; "" means disabled
+    title: str
+    tagline: str
+    eyebrow: str
+    patterns: tuple[re.Pattern, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "patterns",
+                           tuple(_compile_pattern(p) for p in self.include))
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.password)
+
+    def allows(self, rel: str) -> bool:
+        rel = rel.replace("\\", "/")
+        return any(rx.fullmatch(rel) for rx in self.patterns)
+
+    def select(self, files: list[dict]) -> list[dict]:
+        """Filter collect() output to this shelf, preserving its order."""
+        return [f for f in files if self.allows(f["rel"])]
+
+
+class ProfileBook:
+    """Every profile in profiles.json, with passwords resolved from the environment."""
+
+    def __init__(self, profiles: dict[str, Profile], default: Profile | None,
+                 all_profiles: list[Profile] | None = None):
+        self.profiles = profiles          # ENABLED only, config order
+        self.default = default            # even when disabled
+        self.all = all_profiles if all_profiles is not None else list(profiles.values())
+
+    def __bool__(self) -> bool:
+        return bool(self.profiles)
+
+    def get(self, name: str) -> Profile | None:
+        return self.profiles.get(name)
+
+    def match(self, password: str) -> str | None:
+        """The profile whose password this is, or None.
+
+        Every enabled profile is compared, even after a hit, so the response time
+        does not reveal which profile (or how many) exist.
+        """
+        if not password:
+            return None
+        supplied = password.encode("utf-8")
+        found = None
+        for name, profile in self.profiles.items():
+            if hmac.compare_digest(supplied, profile.password.encode("utf-8")):
+                found = name
+        return found
+
+    @classmethod
+    def from_mapping(cls, data: dict, env: Mapping[str, str]) -> "ProfileBook":
+        if not isinstance(data, dict):
+            raise ConfigError("profiles.json must contain a JSON object")
+        if "default" not in data:
+            raise ConfigError("profiles.json: missing the 'default' profile")
+        raw_default = data["default"]
+        if not isinstance(raw_default, dict):
+            raise ConfigError("profiles.json: 'default' must be an object")
+        raw_list = data.get("profiles", [])
+        if not isinstance(raw_list, list):
+            raise ConfigError("profiles.json: 'profiles' must be a list")
+
+        def opt_text(raw: dict, key: str, label: str) -> str | None:
+            if key not in raw:
+                return None
+            value = raw[key]
+            if not isinstance(value, str):
+                raise ConfigError(f"profiles.json: {label} has a non-string {key!r}")
+            return value
+
+        def include_of(raw: dict, label: str) -> tuple[str, ...]:
+            if "include" not in raw:
+                raise ConfigError(f"profiles.json: {label} is missing 'include'")
+            value = raw["include"]
+            if not isinstance(value, list) or not value:
+                raise ConfigError(f"profiles.json: {label} 'include' must be a non-empty list")
+            out = []
+            for item in value:
+                if not isinstance(item, str) or not item.strip():
+                    raise ConfigError(f"profiles.json: {label} has an empty include pattern")
+                out.append(item.strip())
+            for pattern in out:
+                _compile_pattern(pattern)
+            return tuple(out)
+
+        def password_env_of(raw: dict, label: str) -> str:
+            if "password_env" not in raw:
+                raise ConfigError(f"profiles.json: {label} is missing 'password_env'")
+            value = raw["password_env"]
+            if not isinstance(value, str) or not PASSWORD_ENV_RE.match(value):
+                raise ConfigError(f"profiles.json: {label} has an invalid 'password_env'")
+            return value
+
+        def make_profile(name: str, raw: dict, label: str,
+                         d_title: str, d_tagline: str, d_eyebrow: str) -> Profile:
+            password_env = password_env_of(raw, label)
+            value = env.get(password_env, "") or ""
+            return Profile(
+                name=name,
+                include=include_of(raw, label),
+                password_env=password_env,
+                password=str(value),
+                title=opt_text(raw, "title", label) or d_title,
+                tagline=opt_text(raw, "tagline", label) or d_tagline,
+                eyebrow=opt_text(raw, "eyebrow", label) or d_eyebrow,
+            )
+
+        default = make_profile("default", raw_default, "the default profile",
+                               DEFAULT_TITLE, DEFAULT_TAGLINE, DEFAULT_EYEBROW)
+        all_profiles = [default]
+        seen_names = {"default"}
+        for index, raw in enumerate(raw_list):
+            label = f"profiles[{index}]"
+            if not isinstance(raw, dict):
+                raise ConfigError(f"profiles.json: {label} must be an object")
+            name = raw.get("name")
+            if not isinstance(name, str) or not PROFILE_NAME_RE.match(name):
+                raise ConfigError(f"profiles.json: {label} has an invalid 'name'")
+            if name in seen_names:
+                raise ConfigError(f"profiles.json: duplicate profile name {name!r}")
+            seen_names.add(name)
+            all_profiles.append(make_profile(
+                name, raw, f"profile {name!r}",
+                default.title, default.tagline, default.eyebrow,
+            ))
+
+        seen_passwords: dict[str, str] = {}
+        for profile in all_profiles:
+            if not profile.enabled:
+                continue
+            prior = seen_passwords.get(profile.password)
+            if prior is not None:
+                raise ConfigError(
+                    f"profiles.json: {prior} and {profile.password_env} resolve to the "
+                    "same password; every profile password must be unique")
+            seen_passwords[profile.password] = profile.password_env
+
+        enabled = {p.name: p for p in all_profiles if p.enabled}
+        return cls(enabled, default, all_profiles)
+
+
+def load_profiles(path: str, env: Mapping[str, str]) -> ProfileBook:
+    """Read profiles.json and resolve every password from env."""
+    if not os.path.exists(path):
+        return ProfileBook({}, None, [])
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
+    return ProfileBook.from_mapping(data, env)
+
+
+def load_secret() -> dict:
+    """Return auth.json's session secret, creating or upgrading the file.
+
+    Passwords no longer live here: auth.json holds only the HMAC key and the
+    session lifetime. An old 2.x file is rewritten without its password_hash.
+    """
+    data: dict = {}
+    if os.path.exists(AUTH_PATH):
+        try:
+            with open(AUTH_PATH, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError) as exc:
+            print(f"tablinum: cannot read {AUTH_PATH}: {exc}", file=sys.stderr)
+
+    secret = data.get("secret")
+    valid_secret = isinstance(secret, str) and re.fullmatch(r"[0-9a-fA-F]{64}", secret) is not None
+    env_secret = os.environ.get("TABLINUM_SECRET")
+    env_ok = bool(env_secret and re.fullmatch(r"[0-9a-fA-F]{64}", env_secret))
+    if env_secret and not env_ok:
+        print("tablinum: ignoring TABLINUM_SECRET (want 64 hex characters)", file=sys.stderr)
+
+    hours = data.get("session_hours", 12)
+    if not isinstance(hours, (int, float)):
+        hours = 12
+    result = {
+        "secret": env_secret if env_ok else (secret if valid_secret else secrets.token_hex(32)),
+        "session_hours": hours,
+        "updated": data.get("updated") if isinstance(data.get("updated"), int) else int(time.time()),
     }
-    write_auth(data)
+    legacy_keys = [key for key in data if str(key).startswith("password")]
+    if not env_ok and (not valid_secret or legacy_keys):
+        result["updated"] = int(time.time())
+        write_auth(result)
+    return result
 
 
 class Sessions:
-    """HMAC-signed stateless session tokens: `<expiry>.<nonce>.<sig>`."""
+    """HMAC-signed stateless session tokens: `<expiry>.<profile>.<nonce>.<sig>`."""
 
     def __init__(self, secret: str, hours: float = 12):
         self._key = bytes.fromhex(secret)
@@ -226,29 +459,38 @@ class Sessions:
     def _sign(self, payload: str) -> str:
         return hmac.new(self._key, payload.encode("ascii"), hashlib.sha256).hexdigest()
 
-    def issue(self) -> tuple[str, int]:
+    def issue(self, profile: str) -> tuple[str, int]:
         exp = int(time.time()) + self.ttl
-        payload = f"{exp}.{secrets.token_hex(8)}"
+        payload = f"{exp}.{profile}.{secrets.token_hex(8)}"
         return f"{payload}.{self._sign(payload)}", self.ttl
 
-    def valid(self, token: str | None) -> bool:
-        if not token or token.count(".") != 2:
-            return False
-        exp_s, nonce, sig = token.split(".")
-        if not hmac.compare_digest(sig, self._sign(f"{exp_s}.{nonce}")):
-            return False
+    def valid(self, token: str | None) -> str | None:
+        """The profile name carried by a valid token, or None for any failure."""
+        if not token or token.count(".") != 3:
+            return None
+        exp_s, profile, nonce, sig = token.split(".")
+        if not profile:
+            return None
         try:
-            return int(exp_s) > int(time.time())
+            expected = self._sign(f"{exp_s}.{profile}.{nonce}")
+        except UnicodeEncodeError:
+            return None
+        if not hmac.compare_digest(sig, expected):
+            return None
+        try:
+            if int(exp_s) <= int(time.time()):
+                return None
         except ValueError:
-            return False
+            return None
+        return profile
 
 
 class RateLimiter:
     """Failed-login throttle: per-client backoff plus a global ceiling.
 
-    In-memory on purpose. A 12-round bcrypt verify is already slow; the throttle
-    only has to hold for the life of the process, and losing counters on restart
-    is a far smaller problem than a lockout that cannot be cleared.
+    In-memory on purpose. A password check is already slow; the throttle only has
+    to hold for the life of the process, and losing counters on restart is a far
+    smaller problem than a lockout that cannot be cleared.
     """
 
     def __init__(self, per_ip_limit: int = 5, global_limit: int = 60,
@@ -412,6 +654,19 @@ THEME = """
     color: var(--silk-dim); font: inherit; border-bottom: 1px solid #3a4247;
   }
   footer button:hover { color: var(--silk); }
+  .whoami {
+    display: flex; justify-content: flex-end; align-items: center; gap: 12px;
+    margin-bottom: 18px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.71rem; color: var(--silk-dim);
+  }
+  .whoami b { color: var(--amber); font-weight: 500; }
+  .whoami form { display: inline; margin: 0; }
+  .whoami button {
+    background: var(--socket); border: 1px solid var(--hair); border-radius: 3px;
+    padding: 4px 10px; cursor: pointer; color: var(--silk-dim); font: inherit;
+  }
+  .whoami button:hover { color: var(--amber); }
   @media (max-width: 560px) {
     a.row { grid-template-columns: 44px minmax(0, 1fr) auto; gap: 10px; padding: 12px 13px; }
     .fdate { display: none; }
@@ -432,6 +687,7 @@ PAGE = """<!doctype html>
 <body>
 <main>
   <header>
+    __WHOAMI__
     <div class="eyebrow">__EYEBROW__</div>
     <h1>__TITLE__</h1>
     <p class="tagline">__TAGLINE__</p>
@@ -567,7 +823,8 @@ def link_for(rel: str) -> str:
 def render(files: list[dict], *, eyebrow: str, title: str, tagline: str,
            footer_left: str, footer_right: str = "tablinum",
            footer_url: str = "https://github.com/ayaanngandhi/tablinum",
-           nonce: str = "", locked: bool = True) -> str:
+           nonce: str = "", locked: bool = True,
+           profile_name: str | None = None) -> str:
     total = sum(f["size"] for f in files)
 
     groups: dict[str, list[dict]] = {}
@@ -600,15 +857,25 @@ def render(files: list[dict], *, eyebrow: str, title: str, tagline: str,
     if locked:
         right += " &nbsp;·&nbsp; " + LOGOUT_FORM
 
+    whoami = ""
+    if locked and profile_name:
+        whoami = ('<div class="whoami"><span>signed in as <b>'
+                  + html.escape(profile_name)
+                  + '</b></span>' + LOGOUT_FORM + '</div>')
+        state = f"private · signed in as {html.escape(profile_name)}"
+    else:
+        state = "private · signed in" if locked else "public shelf"
+
     return (PAGE
             .replace("__THEME__", THEME)
+            .replace("__WHOAMI__", whoami)
             .replace("__EYEBROW__", html.escape(eyebrow))
             .replace("__TITLE__", html.escape(title))
             .replace("__TAGLINE__", html.escape(tagline))
             .replace("__COUNT__", str(len(files)))
             .replace("__NOUN__", "file" if len(files) == 1 else "files")
             .replace("__SIZE__", human_size(total))
-            .replace("__STATE__", "private · signed in" if locked else "public shelf")
+            .replace("__STATE__", state)
             .replace("__SEARCH__", SEARCH if files else "")
             .replace("__GROUPS__", "\n".join(blocks))
             .replace("__FOOTER_LEFT__", html.escape(footer_left))
@@ -650,14 +917,14 @@ def render_login(cfg: dict, error: str = "", csrf: str = "", wait: int = 0) -> s
     err_html = f'<div class="err" role="alert">{html.escape(error)}</div>' if error else ""
     return (LOGIN_PAGE
             .replace("__THEME__", THEME)
-            .replace("__EYEBROW__", html.escape(cfg.get("eyebrow", "tablinum · the record room")))
-            .replace("__TITLE__", html.escape(cfg.get("title", "Documents")))
+            .replace("__EYEBROW__", html.escape(cfg.get("eyebrow", DEFAULT_EYEBROW)))
+            .replace("__TITLE__", html.escape(cfg.get("title", DEFAULT_TITLE)))
             .replace("__TAGLINE__", "One password, and the door opens.")
             .replace("__CSRF__", html.escape(csrf))
             .replace("__ERROR__", err_html)
             .replace("__HINT__", html.escape(cfg.get(
                 "login_hint",
-                "bcrypt · signed sessions · rate limited"))))
+                "password only · one shelf per person · rate limited"))))
 
 
 def load_site_config(root: str) -> dict:
@@ -674,17 +941,26 @@ def load_site_config(root: str) -> dict:
         return {}
 
 
-def page_for(root: str, cfg: dict, nonce: str = "", locked: bool = True) -> str:
+def page_for(root: str, cfg: dict, profile: Profile | None = None,
+             nonce: str = "", locked: bool = True,
+             profile_name: str | None = None) -> str:
     files = collect(root)
+    if profile is not None:
+        files = profile.select(files)
+        eyebrow, title, tagline = profile.eyebrow, profile.title, profile.tagline
+    else:
+        eyebrow = cfg.get("eyebrow", DEFAULT_EYEBROW)
+        title = cfg.get("title", DEFAULT_TITLE)
+        tagline = cfg.get("tagline", DEFAULT_TAGLINE)
     return render(
         files,
-        eyebrow=cfg.get("eyebrow", "tablinum · the record room"),
-        title=cfg.get("title", "Documents"),
-        tagline=cfg.get("tagline", "Everything kept in one place — notes, papers, reports and references."),
+        eyebrow=eyebrow,
+        title=title,
+        tagline=tagline,
         footer_left=cfg.get("footer_left", f"{len(files)} file{'' if len(files) == 1 else 's'} in files/"),
         footer_right=cfg.get("footer_right", "tablinum on github"),
         footer_url=cfg.get("footer_url", "https://github.com/ayaanngandhi/tablinum"),
-        nonce=nonce, locked=locked,
+        nonce=nonce, locked=locked, profile_name=profile_name,
     )
 
 
@@ -716,6 +992,11 @@ def resolve(root: str, url_path: str) -> str | None:
     return target
 
 
+def rel_to(root: str, target: str) -> str:
+    """A served file's path relative to root, after alias resolution."""
+    return os.path.relpath(target, os.path.realpath(root)).replace(os.sep, "/")
+
+
 def clean_text(value: str | None, limit: int = MAX_PASSWORD_LEN) -> str | None:
     """Sanitise a submitted string: no NULs, no control bytes, bounded length.
 
@@ -732,10 +1013,14 @@ def clean_text(value: str | None, limit: int = MAX_PASSWORD_LEN) -> str | None:
     return value
 
 
-def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
-    sessions = Sessions(auth["secret"], auth.get("session_hours", 12)) if auth else None
-    stored_hash = auth["password_hash"] if auth else None
-    session_secret = auth["secret"] if auth else ""
+def make_handler(root: str, cfg: dict, book: ProfileBook | None, verbose: bool):
+    secret = load_secret() if book else {}
+    sessions = Sessions(secret["secret"], secret.get("session_hours", 12)) if book else None
+    session_secret = secret["secret"] if book else ""
+    login_cfg = dict(cfg)
+    if book and book.default:
+        login_cfg["eyebrow"] = book.default.eyebrow
+        login_cfg["title"] = book.default.title
     limiter = RateLimiter()
 
     class Handler(BaseHTTPRequestHandler):
@@ -800,8 +1085,13 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
                     out[k.strip()] = v.strip()
             return out
 
-        def _session_ok(self) -> bool:
-            return True if not sessions else sessions.valid(self._cookies().get(COOKIE))
+        def _current(self) -> tuple[str | None, Profile | None]:
+            """The live profile for this request; (None, None) under --no-auth."""
+            if not sessions:
+                return None, None
+            name = sessions.valid(self._cookies().get(COOKIE))
+            profile = book.get(name) if name else None
+            return (name, profile) if profile is not None else (None, None)
 
         def _cookie(self, name: str, value: str, max_age: int) -> str:
             bits = [f"{name}={value}", "Path=/", f"Max-Age={max_age}",
@@ -823,7 +1113,7 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
             return head
 
         def _login_response(self, status: int = 200, error: str = "", wait: int = 0,
-                            retry_after: int | None = None):
+                            retry_after: int | None = None, extra: dict | None = None):
             """Render the login page and ALWAYS pair it with a matching CSRF cookie.
 
             Minting a new token for the form without updating the cookie is what
@@ -831,10 +1121,11 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
             their session expired: the form holds token B, the browser holds A.
             """
             csrf = issue_csrf(session_secret)
-            page = render_login(cfg, error=error, csrf=csrf, wait=wait).encode("utf-8")
-            extra = {"Retry-After": str(retry_after)} if retry_after else {}
+            page = render_login(login_cfg, error=error, csrf=csrf, wait=wait).encode("utf-8")
+            head = {"Retry-After": str(retry_after)} if retry_after else {}
+            head.update(extra or {})
             return self._send(status, page, "text/html; charset=utf-8",
-                              self._html_headers("", extra))
+                              self._html_headers("", head))
 
         def _not_found(self):
             body = (b"<!doctype html><meta charset=utf-8><title>Not found</title>"
@@ -855,14 +1146,21 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
                 return self._send(200, b"ok\n", "text/plain; charset=utf-8",
                                   {"Cache-Control": "no-store"})
 
-            if not self._session_ok():
+            name, profile = self._current()
+            if sessions and profile is None:
+                # a deletion or a disabled profile makes an otherwise valid
+                # signature useless: a session is not authorisation by itself
+                clear = {"Set-Cookie": self._cookie(COOKIE, "", 0)}
                 if path == "/login":
-                    return self._login_response()
-                return self._redirect("/login")
+                    return self._login_response(extra=clear)
+                return self._redirect("/login", {
+                    **clear, "Cache-Control": "no-store",
+                })
 
             if path in ("/", "/index.html"):
                 nonce = secrets.token_urlsafe(16)
-                page = page_for(root, cfg, nonce=nonce, locked=bool(sessions)).encode("utf-8")
+                page = page_for(root, cfg, profile=profile, nonce=nonce,
+                                locked=bool(sessions), profile_name=name).encode("utf-8")
                 return self._send(200, page, "text/html; charset=utf-8",
                                   self._html_headers(nonce))
 
@@ -873,6 +1171,9 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
             if path.startswith(MOUNT + "/"):
                 target = resolve(root, path)
                 if not target:
+                    return self._not_found()
+                if profile is not None and not profile.allows(rel_to(root, target)):
+                    # 404, not 403: never confirm that a file exists off-shelf
                     return self._not_found()
                 ext = os.path.splitext(target)[1].lower()
                 ctype = CONTENT_TYPES.get(ext, "application/octet-stream")
@@ -927,10 +1228,6 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
                 return self._redirect("/")
 
             ip = self._ip()
-            wait = limiter.blocked_for(ip)
-            if wait:
-                return self._login_response(429, wait=wait, retry_after=wait)
-
             supplied = clean_text(form.get("csrf", ""), 128) or ""
             if not csrf_ok(session_secret, supplied):
                 print(f"tablinum: rejected a bad/expired csrf token from {ip}", file=sys.stderr)
@@ -938,13 +1235,18 @@ def make_handler(root: str, cfg: dict, auth: dict | None, verbose: bool):
                 # attempts and lock them out of their own shelf
                 return self._login_response(400, "That form expired. Reload and try again.")
 
+            wait = limiter.blocked_for(ip)
+            if wait:
+                return self._login_response(429, wait=wait, retry_after=wait)
+
             password = clean_text(form.get("password", ""))
-            if not password or not verify_password(password, stored_hash):
+            name = book.match(password) if password else None
+            if not name:
                 limiter.record_failure(ip)
                 return self._login_response(401, "That password is not right.")
 
             limiter.reset(ip)
-            token, ttl = sessions.issue()
+            token, ttl = sessions.issue(name)
             return self._redirect("/", {
                 "Set-Cookie": self._cookie(COOKIE, token, ttl),
                 "Cache-Control": "no-store",
@@ -957,18 +1259,30 @@ def serve(root: str, host: str, port: int, verbose: bool, open_mode: bool):
     if not os.path.isdir(root):
         print(f"tablinum: no such directory: {root}", file=sys.stderr)
         return 2
-    auth = load_auth()
-    if not auth and not open_mode:
-        print("tablinum: no password is set, so the shelf will not be served.\n"
-              "  Set one first:  python3 tablinum.py passwd\n"
+    try:
+        book = load_profiles(PROFILES_PATH, environ_with_env_file())
+    except ConfigError as exc:
+        print(f"tablinum: {exc}", file=sys.stderr)
+        return 4
+    if not book and not open_mode:
+        print("tablinum: no profile has a password, so the shelf will not be served.\n"
+              f"  Put at least one password in {ENV_PATH} (copy .env.example and edit it).\n"
               "  Or serve it openly on purpose with --no-auth", file=sys.stderr)
         return 3
     cfg = load_site_config(root)
-    httpd = ThreadingHTTPServer((host, port), make_handler(root, cfg, auth, verbose))
+    active_book = None if open_mode else book
+    httpd = ThreadingHTTPServer((host, port),
+                                make_handler(root, cfg, active_book, verbose))
     httpd.daemon_threads = True
-    count = len(collect(root))
-    state = "locked · bcrypt + signed sessions" if auth else "OPEN · no password"
-    print(f"Tablinum {__version__} — {count} files from {root} — {state}")
+    files = collect(root)
+    if open_mode:
+        print(f"Tablinum {__version__} — {len(files)} files from {root} — OPEN · no password")
+    else:
+        print(f"Tablinum {__version__} — {len(files)} files from {root} — "
+              f"locked · {len(book.profiles)} profile{'' if len(book.profiles) == 1 else 's'}")
+        for profile in book.profiles.values():
+            count = len(profile.select(files))
+            print(f"  {profile.name:<9} {count:>4} files   password from {profile.password_env}")
     print(f"  http://{host}:{port}/")
     sys.stdout.flush()
     try:
@@ -986,8 +1300,13 @@ def build(root: str, out: str, allow_public: bool) -> int:
     if not os.path.isdir(root):
         print(f"tablinum: no such directory: {root}", file=sys.stderr)
         return 2
-    if os.path.exists(AUTH_PATH) and not allow_public:
-        print("tablinum: this shelf has a password, and a static export cannot check it.\n"
+    try:
+        book = load_profiles(PROFILES_PATH, environ_with_env_file())
+    except ConfigError as exc:
+        print(f"tablinum: {exc}", file=sys.stderr)
+        return 4
+    if book and not allow_public:
+        print("tablinum: this shelf has profiles, and a static export cannot check them.\n"
               "  Building would put every file in the clear. If that is really what you\n"
               "  want, re-run with --public.", file=sys.stderr)
         return 4
@@ -998,12 +1317,20 @@ def build(root: str, out: str, allow_public: bool) -> int:
         shutil.rmtree(out)
     os.makedirs(out)
 
+    choice = book.default if book else None
+    files = collect(root)
+    if choice is not None:
+        files = choice.select(files)
+
     dest = os.path.join(out, MOUNT.lstrip("/"))
-    shutil.copytree(root, dest,
-                    ignore=shutil.ignore_patterns(".DS_Store", "__pycache__", ".git", ".venv"))
+    os.makedirs(dest, exist_ok=True)
+    for f in files:
+        target = os.path.join(dest, *f["rel"].split("/"))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(os.path.join(root, *f["rel"].split("/")), target)
 
     cfg = load_site_config(root)
-    index = page_for(root, cfg, locked=False)
+    index = page_for(root, cfg, profile=choice, locked=False)
     for name in ("index.html", "404.html"):
         with open(os.path.join(out, name), "w", encoding="utf-8") as fh:
             fh.write(index)
@@ -1014,7 +1341,6 @@ def build(root: str, out: str, allow_public: bool) -> int:
     with open(os.path.join(out, ".nojekyll"), "w", encoding="utf-8") as fh:
         fh.write("")
 
-    files = collect(root)
     print(f"tablinum: exported {len(files)} files → {out}/")
     print("tablinum: WARNING — a static export is unprotected. Anyone with the URL can read it.")
     return 0
@@ -1024,22 +1350,51 @@ def build(root: str, out: str, allow_public: bool) -> int:
 # cli
 # --------------------------------------------------------------------------
 
-def cmd_passwd(args) -> int:
-    password = args.password
-    if password is None:
+def print_rows(files: list[dict]) -> None:
+    if not files:
+        print("(empty)")
+    for f in files:
+        print(f"{human_size(f['size']):>9}  "
+              f"{time.strftime('%d %b %Y', time.localtime(f['mtime']))}  {f['rel']}")
+
+
+def cmd_list(args) -> int:
+    files = collect(os.path.abspath(args.dir))
+    if args.profile:
         try:
-            password = getpass.getpass("New Tablinum password: ")
-            again = getpass.getpass("Repeat it: ")
-        except (KeyboardInterrupt, EOFError):
-            print("\ntablinum: aborted")
-            return 1
-        if password != again:
-            print("tablinum: the two entries differ — nothing changed", file=sys.stderr)
-            return 1
-    set_password(password, keep_sessions=args.keep_sessions)
-    print(f"tablinum: password set in {AUTH_PATH} (0600, bcrypt)")
-    print("tablinum: session secret kept" if args.keep_sessions
-          else "tablinum: session secret rotated — every existing session is signed out")
+            book = load_profiles(PROFILES_PATH, environ_with_env_file())
+        except ConfigError as exc:
+            print(f"tablinum: {exc}", file=sys.stderr)
+            return 4
+        profile = book.get(args.profile)
+        if profile is None:
+            print(f"tablinum: no enabled profile named {args.profile!r}", file=sys.stderr)
+            return 2
+        files = profile.select(files)
+    print_rows(files)
+    return 0
+
+
+def cmd_status(args) -> int:
+    try:
+        book = load_profiles(PROFILES_PATH, environ_with_env_file())
+    except ConfigError as exc:
+        print(f"tablinum: {exc}", file=sys.stderr)
+        return 4
+    files = collect(os.path.abspath(args.dir))
+    folder = os.path.basename(os.path.normpath(os.path.abspath(args.dir))) + "/"
+    if not book.all:
+        print(f"profiles.json not found · 0 profiles · {len(files)} files under {folder}")
+        return 0
+    enabled = sum(1 for p in book.all if p.enabled)
+    print(f"profiles.json · {enabled} of {len(book.all)} profiles enabled · "
+          f"{len(files)} files under {folder}")
+    for profile in book.all:
+        count = len(profile.select(files))
+        state = "enabled" if profile.enabled else "disabled"
+        note = (f"password from {profile.password_env}" if profile.enabled
+                else f"password from {profile.password_env} (unset)")
+        print(f"  {profile.name:<9} {state:<9} {count:>4} files   {note}")
     return 0
 
 
@@ -1048,11 +1403,6 @@ def main(argv=None) -> int:
                                  description="A small document shelf with a lock on the door.")
     ap.add_argument("--version", action="version", version=f"tablinum {__version__}")
     sub = ap.add_subparsers(dest="cmd")
-
-    pw = sub.add_parser("passwd", help="set the single password (stored as a bcrypt hash)")
-    pw.add_argument("--password", help="non-interactive; otherwise prompted twice")
-    pw.add_argument("--keep-sessions", action="store_true",
-                    help="keep existing sessions valid (default signs everyone out)")
 
     s = sub.add_parser("serve", help="serve files/ over HTTP behind a login")
     s.add_argument("--dir", default=DEFAULT_ROOT, help="directory to publish (default: ./files)")
@@ -1065,12 +1415,13 @@ def main(argv=None) -> int:
     b.add_argument("--dir", default=DEFAULT_ROOT, help="directory to publish (default: ./files)")
     b.add_argument("--out", default="dist", help="output directory (default: ./dist)")
     b.add_argument("--public", action="store_true",
-                   help="allow an unprotected export even though a password is set")
+                   help="allow an unprotected export even though profiles are set")
 
     c = sub.add_parser("list", help="print the index as plain text")
     c.add_argument("--dir", default=DEFAULT_ROOT)
+    c.add_argument("--profile", help="only rows visible to this profile")
 
-    st = sub.add_parser("status", help="show whether a password is configured")
+    st = sub.add_parser("status", help="show profiles, files and sessions")
     st.add_argument("--dir", default=DEFAULT_ROOT)
 
     args = ap.parse_args(argv)
@@ -1078,26 +1429,10 @@ def main(argv=None) -> int:
         return serve(os.path.abspath(args.dir), args.host, args.port, args.verbose, args.no_auth)
     if args.cmd == "build":
         return build(os.path.abspath(args.dir), os.path.abspath(args.out), args.public)
-    if args.cmd == "passwd":
-        return cmd_passwd(args)
     if args.cmd == "list":
-        files = collect(os.path.abspath(args.dir))
-        if not files:
-            print("(empty)")
-        for f in files:
-            print(f"{human_size(f['size']):>9}  "
-                  f"{time.strftime('%d %b %Y', time.localtime(f['mtime']))}  {f['rel']}")
-        return 0
+        return cmd_list(args)
     if args.cmd == "status":
-        auth = load_auth()
-        files = collect(os.path.abspath(args.dir))
-        if auth:
-            mode = oct(stat.S_IMODE(os.stat(AUTH_PATH).st_mode))
-            print(f"locked · password set {time.strftime('%d %b %Y %H:%M', time.localtime(auth.get('updated', 0)))}"
-                  f" · auth.json {mode} · sessions {auth.get('session_hours', 12)}h · {len(files)} files")
-        else:
-            print(f"unlocked · no password configured · {len(files)} files")
-        return 0
+        return cmd_status(args)
     ap.print_help()
     return 0
 

@@ -3,9 +3,10 @@
 
     .venv/bin/python -m unittest discover -s tests -v
 
-Covers the parts that must never silently regress: password handling, session
-token integrity, throttling, path containment, and the build guard that stops a
-locked shelf from being exported in the clear.
+Covers the parts that must never silently regress: profile config, glob
+matching, dotenv loading, session token integrity, throttling, path containment,
+per-profile authorisation, and the build guard that stops a locked shelf from
+being exported in the clear.
 """
 
 import http.client
@@ -22,9 +23,43 @@ from http.server import ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tablinum as T  # noqa: E402
 
+# Keep tests away from the project's real auth.json, and make session keys
+# deterministic per run without touching disk.
+os.environ["TABLINUM_SECRET"] = "ab" * 32
+T.AUTH_PATH = os.path.join(tempfile.mkdtemp(), "auth.json")
 
-def start_server(root, auth, cfg=None):
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), T.make_handler(root, cfg or {}, auth, False))
+
+def book(**specs):
+    """Build a ProfileBook. Each kwarg is a password, or (password, include)."""
+    data = {
+        "default": {"include": ["*"], "password_env": "TABLINUM_PASSWORD"},
+        "profiles": [],
+    }
+    env = {}
+    for name, spec in specs.items():
+        if name == "default":
+            if spec is None:
+                continue
+            password, include = spec if isinstance(spec, tuple) else (spec, ["*"])
+            data["default"]["include"] = list(include)
+            env["TABLINUM_PASSWORD"] = password
+        else:
+            entry = {
+                "name": name,
+                "include": ["*"],
+                "password_env": "TABLINUM_PASSWORD_" + name.upper().replace("-", "_"),
+            }
+            if spec is not None:
+                password, include = spec if isinstance(spec, tuple) else (spec, ["*"])
+                entry["include"] = list(include)
+                env[entry["password_env"]] = password
+            data["profiles"].append(entry)
+    return T.ProfileBook.from_mapping(data, env)
+
+
+def start_server(root, profiles, cfg=None):
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0),
+                                T.make_handler(root, cfg or {}, profiles, False))
     httpd.daemon_threads = True
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, httpd.server_address[1]
@@ -61,34 +96,171 @@ class Fake:
         return resp.status, dict(resp.getheaders()), data
 
 
-class UnitTests(unittest.TestCase):
-    def test_password_round_trip(self):
-        h = T.hash_password("correct-horse-battery-staple", rounds=4)
-        self.assertTrue(h.startswith("$2"))
-        self.assertNotIn("correct", h)          # the password itself is never stored
-        self.assertTrue(T.verify_password("correct-horse-battery-staple", h))
-        self.assertFalse(T.verify_password("correct-horse-battery-stapl", h))
-        self.assertFalse(T.verify_password("", h))
-        self.assertFalse(T.verify_password("x", "not-a-hash"))  # malformed hash, no crash
+class GlobTests(unittest.TestCase):
+    def test_star_matches_nested_paths(self):
+        self.assertTrue(T.matches("short-term/saarthi-v7/review.html", ["*"]))
+        self.assertTrue(T.matches("a/b/c.txt", ["*"]))
 
-    def test_session_token_integrity(self):
+    def test_folder_star_includes_nested_files(self):
+        self.assertTrue(T.matches("short-term/a.html", ["short-term/*"]))
+        self.assertTrue(T.matches("short-term/deep/b.png", ["short-term/*"]))
+        self.assertFalse(T.matches("secret/hidden.pdf", ["short-term/*"]))
+
+    def test_exact_path(self):
+        self.assertTrue(T.matches("short-term/a.html", ["short-term/a.html"]))
+        self.assertFalse(T.matches("short-term/a.html", ["short-term/b.html"]))
+
+    def test_question_mark_is_one_character(self):
+        self.assertTrue(T.matches("a.html", ["?.html"]))
+        self.assertFalse(T.matches("ab.html", ["?.html"]))
+
+    def test_case_insensitive(self):
+        self.assertTrue(T.matches("Short-Term/A.HTML", ["short-term/*"]))
+        self.assertTrue(T.matches("notes/ReadMe.md", ["NOTES/readme.MD"]))
+
+    def test_empty_pattern_list_matches_nothing(self):
+        self.assertFalse(T.matches("anything.txt", []))
+
+    def test_leading_slash_and_dot_slash_stripped(self):
+        self.assertTrue(T.matches("a.html", ["/a.html"]))
+        self.assertTrue(T.matches("a.html", ["./a.html"]))
+        self.assertTrue(T.matches("deep/a.html", ["./deep/*"]))
+
+    def test_dotdot_rejected(self):
+        with self.assertRaises(T.ConfigError):
+            T.matches("x.txt", ["../x.txt"])
+        with self.assertRaises(T.ConfigError):
+            T.ProfileBook.from_mapping(
+                {"default": {"include": ["a/../x"], "password_env": "P"}}, {"P": "pw"})
+
+
+class ConfigTests(unittest.TestCase):
+    def test_default_only_file_works(self):
+        b = T.ProfileBook.from_mapping(
+            {"default": {"include": ["*"], "password_env": "P"}}, {"P": "pw"})
+        self.assertTrue(b)
+        self.assertIn("default", b.profiles)
+        self.assertIsNotNone(b.default)
+        self.assertEqual(b.default.name, "default")
+
+    def test_unset_env_disables_a_profile(self):
+        data = {
+            "default": {"include": ["*"], "password_env": "P"},
+            "profiles": [{"name": "shared", "include": ["s/*"], "password_env": "Q"}],
+        }
+        b = T.ProfileBook.from_mapping(data, {"Q": "shared-pw"})
+        self.assertTrue(b)
+        self.assertNotIn("default", b.profiles)
+        self.assertIsNone(b.get("default"))
+        self.assertIsNotNone(b.default)
+        self.assertFalse(b.default.enabled)
+        self.assertIn("shared", b.profiles)
+
+    def test_missing_include_raises(self):
+        with self.assertRaises(T.ConfigError):
+            T.ProfileBook.from_mapping(
+                {"default": {"password_env": "P"}}, {"P": "pw"})
+
+    def test_missing_password_env_raises(self):
+        with self.assertRaises(T.ConfigError):
+            T.ProfileBook.from_mapping({"default": {"include": ["*"]}}, {})
+
+    def test_bad_profile_name_raises(self):
+        for name in ("Shared", "../x", "", "a" * 33):
+            with self.assertRaises(T.ConfigError, msg=name):
+                T.ProfileBook.from_mapping({
+                    "default": {"include": ["*"], "password_env": "P"},
+                    "profiles": [{"name": name, "include": ["*"], "password_env": "Q"}],
+                }, {"P": "pw", "Q": "other"})
+
+    def test_duplicate_profile_name_raises(self):
+        with self.assertRaises(T.ConfigError):
+            T.ProfileBook.from_mapping({
+                "default": {"include": ["*"], "password_env": "P"},
+                "profiles": [
+                    {"name": "shared", "include": ["*"], "password_env": "Q"},
+                    {"name": "shared", "include": ["*"], "password_env": "R"},
+                ],
+            }, {"P": "pw", "Q": "one", "R": "two"})
+
+    def test_duplicate_enabled_password_names_both_env_vars(self):
+        data = {
+            "default": {"include": ["*"], "password_env": "TABLINUM_PASSWORD"},
+            "profiles": [{"name": "shared", "include": ["*"],
+                          "password_env": "TABLINUM_PASSWORD_SHARED"}],
+        }
+        with self.assertRaises(T.ConfigError) as caught:
+            T.ProfileBook.from_mapping(
+                data, {"TABLINUM_PASSWORD": "same-secret",
+                       "TABLINUM_PASSWORD_SHARED": "same-secret"})
+        message = str(caught.exception)
+        self.assertIn("TABLINUM_PASSWORD", message)
+        self.assertIn("TABLINUM_PASSWORD_SHARED", message)
+        self.assertNotIn("same-secret", message)
+
+
+class EnvTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, ".env")
+
+    def test_comments_blank_lines_export_and_quotes(self):
+        with open(self.path, "w") as fh:
+            fh.write("# a comment\n\nA=1\nexport B=two\nC='three'\nD=\"four five\"\n")
+        got = T.load_env(self.path)
+        self.assertEqual(got, {"A": "1", "B": "two", "C": "three", "D": "four five"})
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(T.load_env(os.path.join(self.tmp, "nope")), {})
+
+    def test_real_environment_wins(self):
+        os.environ["TABLINUM_TEST_ENV_KEY"] = "real"
+        try:
+            with open(self.path, "w") as fh:
+                fh.write("TABLINUM_TEST_ENV_KEY=from-file\nOTHER=kept\n")
+            got = T.load_env(self.path)
+            self.assertNotIn("TABLINUM_TEST_ENV_KEY", got)
+            self.assertEqual(got["OTHER"], "kept")
+        finally:
+            os.environ.pop("TABLINUM_TEST_ENV_KEY", None)
+
+
+class SessionTests(unittest.TestCase):
+    def test_session_token_carries_the_profile(self):
         s = T.Sessions(os.urandom(32).hex(), hours=1)
-        token, ttl = s.issue()
-        self.assertTrue(s.valid(token))
+        token, ttl = s.issue("shared")
         self.assertEqual(ttl, 3600)
-        self.assertFalse(s.valid(None))
-        self.assertFalse(s.valid(""))
-        self.assertFalse(s.valid("garbage"))
-        self.assertFalse(s.valid(token + "0"))            # tampered signature
-        exp, nonce, sig = token.split(".")
-        self.assertFalse(s.valid(f"{int(exp) + 60}.{nonce}.{sig}"))  # extended expiry
-        self.assertFalse(T.Sessions(os.urandom(32).hex()).valid(token))  # wrong key
+        self.assertEqual(token.count("."), 3)
+        self.assertEqual(s.valid(token), "shared")
+        self.assertIsNone(s.valid(None))
+        self.assertIsNone(s.valid(""))
+        self.assertIsNone(s.valid("garbage"))
+        self.assertIsNone(s.valid(token + "0"))            # tampered signature
+        self.assertIsNone(T.Sessions(os.urandom(32).hex()).valid(token))  # wrong key
+
+    def test_tampering_with_the_profile_invalidates_it(self):
+        s = T.Sessions(os.urandom(32).hex(), hours=1)
+        token, _ = s.issue("shared")
+        exp, _profile, nonce, sig = token.split(".")
+        self.assertIsNone(s.valid(f"{exp}.default.{nonce}.{sig}"))
+
+    def test_old_two_field_token_rejected(self):
+        s = T.Sessions(os.urandom(32).hex(), hours=1)
+        self.assertIsNone(s.valid("123.nonce.sig"))
 
     def test_expired_session_rejected(self):
         s = T.Sessions(os.urandom(32).hex(), hours=0)
-        token, _ = s.issue()
-        self.assertFalse(s.valid(token))
+        token, _ = s.issue("default")
+        self.assertIsNone(s.valid(token))
 
+    def test_extended_expiry_rejected(self):
+        s = T.Sessions(os.urandom(32).hex(), hours=1)
+        token, _ = s.issue("default")
+        exp, profile, nonce, sig = token.split(".")
+        self.assertIsNone(s.valid(f"{int(exp) + 60}.{profile}.{nonce}.{sig}"))
+
+
+class CleanTextTests(unittest.TestCase):
     def test_clean_text(self):
         self.assertEqual(T.clean_text("plain"), "plain")
         self.assertEqual(T.clean_text(" spaces kept "), " spaces kept ")
@@ -97,6 +269,8 @@ class UnitTests(unittest.TestCase):
         self.assertIsNone(T.clean_text("new\nline"))
         self.assertIsNone(T.clean_text("x" * (T.MAX_PASSWORD_LEN + 1)))
 
+
+class RateLimiterTests(unittest.TestCase):
     def test_rate_limiter_backoff(self):
         rl = T.RateLimiter(per_ip_limit=3, global_limit=100, window=60, max_delay=300)
         for _ in range(3):
@@ -126,6 +300,10 @@ class ResolveTests(unittest.TestCase):
     def test_extensionless_html_alias(self):
         self.assertTrue(T.resolve(self.root, "/files/a").endswith("a.html"))
         self.assertIsNone(T.resolve(self.root, "/files/nope"))
+
+    def test_rel_after_alias_resolution(self):
+        target = T.resolve(self.root, "/files/a")
+        self.assertEqual(T.rel_to(self.root, target), "a.html")
 
     def test_traversal_blocked(self):
         for attack in (
@@ -158,12 +336,8 @@ class ServerTests(unittest.TestCase):
         os.makedirs(cls.root)
         with open(os.path.join(cls.root, "notes.html"), "w") as fh:
             fh.write("<h1>hello</h1>")
-        cls.auth = {
-            "password_hash": T.hash_password("correct-horse-battery-staple", rounds=4),
-            "secret": os.urandom(32).hex(),
-            "session_hours": 1,
-        }
-        cls.httpd, cls.port = start_server(cls.root, cls.auth)
+        cls.book = book(default="correct-horse-battery-staple")
+        cls.httpd, cls.port = start_server(cls.root, cls.book)
 
     @classmethod
     def tearDownClass(cls):
@@ -204,6 +378,7 @@ class AuthFlowTests(ServerTests):
         self.assertIn("form-action 'self'", headers.get("Content-Security-Policy", ""))
         self.assertEqual(headers.get("Cache-Control"), "no-store")
         self.assertEqual(headers.get("X-Frame-Options"), "DENY")
+        self.assertNotIn("shared", text.lower())
 
     def test_wrong_password_rejected(self):
         status, _headers, body = self.login("wrong-password")
@@ -241,6 +416,7 @@ class AuthFlowTests(ServerTests):
         self.assertEqual(status, 200)
         self.assertIn(b"notes.html", body)
         self.assertIn(b"sign out", body)
+        self.assertIn(b"default", body)
 
         status, _h, body = self.c.request("GET", "/files/notes")
         self.assertEqual(status, 200)
@@ -273,7 +449,7 @@ class AuthFlowTests(ServerTests):
         self.login()
         status, _h, body = self.c.request("GET", "/files/../auth.json")
         self.assertIn(status, (404, 200))
-        self.assertNotIn(b"password_hash", body)  # never leaks the hash
+        self.assertNotIn(b"password_hash", body)  # never leaks the old hash
 
     def test_login_sets_only_the_session_cookie(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -300,6 +476,117 @@ class AuthFlowTests(ServerTests):
     def test_healthz_is_open(self):
         status, _h, body = self.c.request("GET", "/healthz")
         self.assertEqual((status, body.strip()), (200, b"ok"))
+
+
+class ProfileAuthTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.root = os.path.join(cls.tmp, "files")
+        os.makedirs(os.path.join(cls.root, "short-term", "deep"))
+        os.makedirs(os.path.join(cls.root, "secret"))
+        for name, content in (
+            ("top.txt", b"top"),
+            (os.path.join("short-term", "note.html"), b"<h1>note</h1>"),
+            (os.path.join("short-term", "deep", "img.png"), b"png"),
+            (os.path.join("secret", "hidden.pdf"), b"pdf"),
+        ):
+            with open(os.path.join(cls.root, name), "wb") as fh:
+                fh.write(content)
+        cls.book = book(default="default-pw", shared=("shared-pw", ["short-term/*"]))
+        cls.httpd, cls.port = start_server(cls.root, cls.book)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def setUp(self):
+        self.c = Fake(self.port)
+
+    def _csrf(self):
+        status, _headers, body = self.c.request("GET", "/login")
+        self.assertEqual(status, 200)
+        return re.search(r'name="csrf" value="([^"]+)"', body.decode()).group(1)
+
+    def login(self, password):
+        return self.c.request("POST", "/login",
+                              {"csrf": self._csrf(), "password": password})
+
+    def index(self):
+        status, _h, body = self.c.request("GET", "/")
+        self.assertEqual(status, 200)
+        return body.decode()
+
+    def test_shared_sees_only_its_shelf(self):
+        self.assertEqual(self.login("shared-pw")[0], 303)
+        text = self.index()
+        self.assertIn("note.html", text)
+        self.assertIn("img.png", text)
+        self.assertNotIn("hidden.pdf", text)
+        self.assertNotIn("top.txt", text)
+        self.assertIn("signed in as", text)
+        self.assertIn("shared", text)
+
+    def test_shared_can_fetch_its_own_file(self):
+        self.login("shared-pw")
+        status, _h, body = self.c.request("GET", "/files/short-term/note")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"<h1>note</h1>")
+
+    def test_shared_gets_404_off_its_shelf(self):
+        self.login("shared-pw")
+        for path in ("/files/secret/hidden.pdf", "/files/secret/hidden",
+                     "/files/top.txt"):
+            status, _h, body = self.c.request("GET", path)
+            self.assertEqual(status, 404, path)
+            self.assertIn(b"Not found", body)
+
+    def test_default_sees_everything(self):
+        self.assertEqual(self.login("default-pw")[0], 303)
+        text = self.index()
+        for name in ("note.html", "img.png", "hidden.pdf", "top.txt"):
+            self.assertIn(name, text)
+        status, _h, body = self.c.request("GET", "/files/secret/hidden.pdf")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"pdf")
+
+    def test_unknown_profile_name_in_token_is_rejected(self):
+        self.login("shared-pw")
+        token = self.c.cookies[T.COOKIE]
+        exp, _profile, nonce, sig = token.split(".")
+        # sign a token for a profile that is no longer in the book
+        session = T.Sessions(os.environ["TABLINUM_SECRET"], hours=1)
+        forged = f"{exp}.gone.{nonce}.{session._sign(f'{exp}.gone.{nonce}')}"
+        self.c.cookies[T.COOKIE] = forged
+        status, headers, _ = self.c.request("GET", "/")
+        self.assertEqual(status, 303)
+        self.assertEqual(headers.get("Location"), "/login")
+        self.assertNotIn(T.COOKIE, self.c.cookies)
+
+
+class NoAuthTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.root = os.path.join(cls.tmp, "files")
+        os.makedirs(os.path.join(cls.root, "secret"))
+        for name in ("top.txt", os.path.join("secret", "hidden.pdf")):
+            with open(os.path.join(cls.root, name), "w") as fh:
+                fh.write("x")
+        cls.httpd, cls.port = start_server(cls.root, None)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def test_no_auth_serves_everything_without_sign_out(self):
+        c = Fake(self.port)
+        status, _h, body = c.request("GET", "/")
+        self.assertEqual(status, 200)
+        text = body.decode()
+        self.assertIn("public shelf", text)
+        self.assertNotIn("sign out", text)
+        self.assertEqual(c.request("GET", "/files/secret/hidden.pdf")[0], 200)
 
 
 class CsrfRecoveryTests(ServerTests):
@@ -363,17 +650,21 @@ class ThrottleTests(ServerTests):
 
 
 class BuildGuardTests(unittest.TestCase):
-    def test_static_export_refuses_while_locked(self):
+    def test_static_export_refuses_while_profiles_exist(self):
         tmp = tempfile.mkdtemp()
         root = os.path.join(tmp, "files")
         os.makedirs(root)
         with open(os.path.join(root, "x.html"), "w") as fh:
             fh.write("x")
-        original = T.AUTH_PATH
+        original_profiles = T.PROFILES_PATH
+        original_env = T.ENV_PATH
         try:
-            T.AUTH_PATH = os.path.join(tmp, "auth.json")
-            T.write_auth({"password_hash": T.hash_password("pw", rounds=4),
-                          "secret": os.urandom(32).hex()})
+            T.PROFILES_PATH = os.path.join(tmp, "profiles.json")
+            T.ENV_PATH = os.path.join(tmp, ".env")
+            with open(T.PROFILES_PATH, "w") as fh:
+                json.dump({"default": {"include": ["*"],
+                                       "password_env": "TABLINUM_BUILD_TEST_PW"}}, fh)
+            os.environ["TABLINUM_BUILD_TEST_PW"] = "pw"
             code = T.build(root, os.path.join(tmp, "dist"), allow_public=False)
             self.assertEqual(code, 4)
             self.assertFalse(os.path.exists(os.path.join(tmp, "dist")))
@@ -383,22 +674,46 @@ class BuildGuardTests(unittest.TestCase):
             with open(os.path.join(tmp, "dist", "index.html")) as fh:
                 self.assertNotIn("sign out", fh.read())
         finally:
-            T.AUTH_PATH = original
+            T.PROFILES_PATH = original_profiles
+            T.ENV_PATH = original_env
+            os.environ.pop("TABLINUM_BUILD_TEST_PW", None)
 
-    def test_auth_file_is_0600(self):
+    def test_auth_file_is_0600_and_holds_no_password(self):
         tmp = tempfile.mkdtemp()
         original = T.AUTH_PATH
         try:
             T.AUTH_PATH = os.path.join(tmp, "auth.json")
-            T.write_auth({"password_hash": T.hash_password("pw", rounds=4),
-                          "secret": os.urandom(32).hex()})
+            T.write_auth({"secret": "ab" * 32, "session_hours": 12, "updated": 0})
             mode = oct(os.stat(T.AUTH_PATH).st_mode & 0o777)
             self.assertEqual(mode, "0o600")
             with open(T.AUTH_PATH) as fh:
                 data = json.load(fh)
-            self.assertTrue(data["password_hash"].startswith("$2"))
+            self.assertEqual(data["secret"], "ab" * 32)
+            self.assertNotIn("password_hash", data)
         finally:
             T.AUTH_PATH = original
+
+    def test_load_secret_upgrades_an_old_auth_file(self):
+        tmp = tempfile.mkdtemp()
+        original = T.AUTH_PATH
+        saved = os.environ.pop("TABLINUM_SECRET", None)
+        try:
+            T.AUTH_PATH = os.path.join(tmp, "auth.json")
+            secret = "cd" * 32
+            with open(T.AUTH_PATH, "w") as fh:
+                json.dump({"password_hash": "$2b$old", "secret": secret,
+                           "session_hours": 7}, fh)
+            got = T.load_secret()
+            self.assertEqual(got["secret"], secret)
+            with open(T.AUTH_PATH) as fh:
+                data = json.load(fh)
+            self.assertNotIn("password_hash", data)
+            self.assertEqual(data["secret"], secret)
+            self.assertEqual(data["session_hours"], 7)
+        finally:
+            T.AUTH_PATH = original
+            if saved is not None:
+                os.environ["TABLINUM_SECRET"] = saved
 
 
 class CollectTests(unittest.TestCase):
